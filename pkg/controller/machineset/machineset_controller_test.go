@@ -29,10 +29,12 @@ import (
 	"golang.org/x/net/context"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -45,6 +47,159 @@ var machinesetKey1 = types.NamespacedName{Name: "machineset1", Namespace: "defau
 var machinesetKey2 = types.NamespacedName{Name: "machineset2", Namespace: "default"}
 
 const timeout = time.Second * 10
+
+func TestHostMatches(t *testing.T) {
+	scheme := runtime.NewScheme()
+	machinev1beta1.AddToScheme(scheme)
+	ctx := context.TODO()
+
+	testCases := []struct {
+		Host          *bmh.BareMetalHost
+		HSelector     labels.Selector
+		MSSelector    labels.Selector
+		Machines      []runtime.Object
+		ExpectMatch   bool
+		ExpectMessage string
+	}{
+		{
+			Host: &bmh.BareMetalHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "host1",
+					Namespace: "default",
+					Labels:    map[string]string{"size": "large"},
+				},
+			},
+			HSelector: labels.SelectorFromSet(map[string]string{
+				"size": "large",
+			}),
+			MSSelector:    labels.NewSelector(),
+			ExpectMatch:   true,
+			ExpectMessage: "Expected match: available host has matching label",
+		},
+		{
+			Host: &bmh.BareMetalHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "host1",
+					Namespace: "default",
+					Labels:    map[string]string{"size": "large"},
+				},
+			},
+			HSelector: labels.SelectorFromSet(map[string]string{
+				"size": "extralarge",
+			}),
+			MSSelector:    labels.NewSelector(),
+			ExpectMatch:   false,
+			ExpectMessage: "Expected no match: available host has non-matching label value",
+		},
+		{
+			Host: &bmh.BareMetalHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "host1",
+					Namespace: "default",
+					Labels:    map[string]string{"size": "large"},
+				},
+				Spec: bmh.BareMetalHostSpec{
+					ConsumerRef: &v1.ObjectReference{
+						Kind:       "Machine",
+						APIVersion: machinev1beta1.SchemeGroupVersion.String(),
+						Name:       "machine1",
+						Namespace:  "default",
+					},
+				},
+			},
+			Machines: []runtime.Object{
+				&machinev1beta1.Machine{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "machine1",
+						Namespace: "default",
+						Labels:    map[string]string{"machine.openshift.io/cluster-api-machineset": "cluster0-storage"},
+					},
+				},
+			},
+			HSelector: labels.SelectorFromSet(map[string]string{
+				"size": "extralarge",
+			}),
+			MSSelector: labels.SelectorFromSet(map[string]string{
+				"machine.openshift.io/cluster-api-machineset": "cluster0-storage",
+			}),
+			ExpectMatch:   true,
+			ExpectMessage: "Expected match: host consumer is a Machine that matches the MSSelector, even though the host has a non-matching label value",
+		},
+		{
+			Host: &bmh.BareMetalHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "host1",
+					Namespace: "default",
+					Labels:    map[string]string{"size": "large"},
+				},
+				Spec: bmh.BareMetalHostSpec{
+					ConsumerRef: &v1.ObjectReference{
+						Kind:       "Machine",
+						APIVersion: machinev1beta1.SchemeGroupVersion.String(),
+						Name:       "machine1",
+						Namespace:  "default",
+					},
+				},
+			},
+			Machines: []runtime.Object{
+				&machinev1beta1.Machine{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "machine1",
+						Namespace: "default",
+						Labels:    map[string]string{"machine.openshift.io/cluster-api-machineset": "cluster0-workers"},
+					},
+				},
+			},
+			HSelector: labels.SelectorFromSet(map[string]string{
+				"size": "large",
+			}),
+			MSSelector: labels.SelectorFromSet(map[string]string{
+				"machine.openshift.io/cluster-api-machineset": "cluster0-storage",
+			}),
+			ExpectMatch:   false,
+			ExpectMessage: "Expected no match: host consumer is a Machine that does not match the MSSelector",
+		},
+		{
+			Host: &bmh.BareMetalHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "host1",
+					Namespace: "default",
+					Labels:    map[string]string{"size": "large"},
+				},
+				Spec: bmh.BareMetalHostSpec{
+					ConsumerRef: &v1.ObjectReference{
+						Kind:       "NotAMachine",
+						APIVersion: machinev1beta1.SchemeGroupVersion.String(),
+						Name:       "machine1",
+						Namespace:  "default",
+					},
+				},
+			},
+			HSelector: labels.SelectorFromSet(map[string]string{
+				"size": "large",
+			}),
+			MSSelector:    labels.NewSelector(),
+			ExpectMatch:   false,
+			ExpectMessage: "Expected no match: host consumer is not a Machine",
+		},
+	}
+
+	for _, tc := range testCases {
+		c := fakeclient.NewFakeClientWithScheme(scheme, tc.Machines...)
+		reconciler := ReconcileMachineSet{
+			Client: c,
+			scheme: scheme,
+		}
+		result, err := reconciler.hostMatches(ctx, tc.HSelector, tc.MSSelector, tc.Host)
+		if err != nil {
+			t.Errorf("%v", err)
+		}
+		if result != tc.ExpectMatch {
+			t.Logf(tc.ExpectMessage)
+			t.FailNow()
+		}
+	}
+}
 
 func TestScale(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
@@ -142,6 +297,23 @@ func TestScale(t *testing.T) {
 			},
 		},
 	}
+	// This host is consumed by something that is not a Machine, so it should
+	// not be counted
+	host5 := bmh.BareMetalHost{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "host5",
+			Namespace: "default",
+			Labels:    map[string]string{"size": "large"},
+		},
+		Spec: bmh.BareMetalHostSpec{
+			ConsumerRef: &v1.ObjectReference{
+				Kind:       "NotAMachine",
+				APIVersion: machinev1beta1.SchemeGroupVersion.String(),
+				Name:       "notamachine1",
+				Namespace:  "default",
+			},
+		},
+	}
 
 	// Setup the Manager and Controller. Wrap the Controller Reconcile function
 	// so it writes each request to a channel when it is finished.
@@ -161,7 +333,7 @@ func TestScale(t *testing.T) {
 	}()
 
 	// Create BareMetalHosts
-	hosts := []runtime.Object{&host1, &host2, &host3, &host4}
+	hosts := []runtime.Object{&host1, &host2, &host3, &host4, &host5}
 	for i := range hosts {
 		err = c.Create(context.TODO(), hosts[i])
 		g.Expect(err).NotTo(gomega.HaveOccurred())

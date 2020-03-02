@@ -18,6 +18,7 @@ package machineset
 
 import (
 	"context"
+	"fmt"
 
 	bmh "github.com/metal3-io/baremetal-operator/pkg/apis/metal3/v1alpha1"
 	actuator "github.com/metal3-io/cluster-api-provider-baremetal/pkg/cloud/baremetal/actuators/machine"
@@ -38,6 +39,11 @@ import (
 )
 
 var log = logf.Log.WithName("machineset-controller")
+
+// errConsumerNotFound indicates that the Machine referenced in a BareMetalHost's
+// Spec.ConsumerRef cannot be found. That's an unexpected state, so we don't
+// want to do any scaling until it gets resolved.
+var errConsumerNotFound = fmt.Errorf("consuming Machine not found")
 
 // Add creates a new MachineSet Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
@@ -141,39 +147,15 @@ func (r *ReconcileMachineSet) Reconcile(request reconcile.Request) (reconcile.Re
 	}
 
 	var count int32
-	for _, host := range hosts.Items {
-		consumer := host.Spec.ConsumerRef
-		if consumer == nil {
-			if hostselector.Matches(labels.Set(host.ObjectMeta.Labels)) {
-				count++
-			}
-		} else {
-			// We will only count this host if it is consumed by a Machine that
-			// is part of the current MachineSet.
-			machine := &machinev1beta1.Machine{}
-			if consumer.Kind != "Machine" || consumer.APIVersion != machinev1beta1.SchemeGroupVersion.String() {
-				// this host is being consumed by something else; don't count it
-				continue
-			}
-
-			// host is being consumed. Let's get the Machine and see if it
-			// matches the current MachineSet.
-			nn := types.NamespacedName{
-				Name:      consumer.Name,
-				Namespace: consumer.Namespace,
-			}
-			err := r.Get(ctx, nn, machine)
-			if err != nil {
-				if errors.IsNotFound(err) {
-					log.Info("Will not scale while BareMetalHost's consuming Machine is not found", "Machine.Name", nn.Name)
-					return reconcile.Result{}, nil
-				}
-				// Error reading the object - requeue the request.
-				return reconcile.Result{}, err
-			}
-			if msselector.Matches(labels.Set(machine.ObjectMeta.Labels)) {
-				count++
-			}
+	for i := range hosts.Items {
+		matches, err := r.hostMatches(ctx, hostselector, msselector, &hosts.Items[i])
+		switch {
+		case err == errConsumerNotFound:
+			return reconcile.Result{}, nil
+		case err != nil:
+			return reconcile.Result{}, err
+		case matches == true:
+			count++
 		}
 	}
 
@@ -188,4 +170,39 @@ func (r *ReconcileMachineSet) Reconcile(request reconcile.Request) (reconcile.Re
 	}
 
 	return reconcile.Result{}, nil
+}
+
+// hostMatches returns true if the BareMetalHost matches the MachineSet.
+func (r *ReconcileMachineSet) hostMatches(ctx context.Context, hostselector labels.Selector,
+	msselector labels.Selector, host *bmh.BareMetalHost) (bool, error) {
+	consumer := host.Spec.ConsumerRef
+
+	if consumer == nil {
+		return hostselector.Matches(labels.Set(host.ObjectMeta.Labels)), nil
+	}
+
+	// We will only count this host if it is consumed by a Machine that
+	// is part of the current MachineSet.
+	machine := &machinev1beta1.Machine{}
+	if consumer.Kind != "Machine" || consumer.APIVersion != machinev1beta1.SchemeGroupVersion.String() {
+		// this host is being consumed by something else; don't count it
+		return false, nil
+	}
+
+	// host is being consumed. Let's get the Machine and see if it
+	// matches the current MachineSet.
+	nn := types.NamespacedName{
+		Name:      consumer.Name,
+		Namespace: consumer.Namespace,
+	}
+	err := r.Get(ctx, nn, machine)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Will not scale while BareMetalHost's consuming Machine is not found", "Machine.Name", nn.Name)
+			return false, errConsumerNotFound
+		}
+		// Error reading the object - requeue the request.
+		return false, err
+	}
+	return msselector.Matches(labels.Set(machine.ObjectMeta.Labels)), nil
 }
